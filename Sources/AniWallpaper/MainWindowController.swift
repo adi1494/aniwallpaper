@@ -42,9 +42,11 @@ final class WallpaperCell: NSCollectionViewItem {
         }
     }
 
-    func configure(url: URL) {
+    func configure(url: URL, isActive: Bool) {
         representedURL = url
-        textField?.stringValue = url.deletingPathExtension().lastPathComponent
+        let name = url.deletingPathExtension().lastPathComponent
+        textField?.stringValue = isActive ? "● \(name)" : name
+        textField?.font = isActive ? .boldSystemFont(ofSize: 12) : .systemFont(ofSize: 12)
         imageView?.image = nil
         Task { @MainActor in
             let img = await Thumbnails.image(for: url)
@@ -53,27 +55,30 @@ final class WallpaperCell: NSCollectionViewItem {
     }
 }
 
-final class LibraryWindowController: NSWindowController, NSCollectionViewDataSource, NSCollectionViewDelegate {
-    var onApply: ((URL) -> Void)?
-    var onPickStill: ((URL) -> Void)?
+/// Single window with two tabs: Library and Active Wallpaper.
+final class MainWindowController: NSWindowController, NSCollectionViewDataSource, NSCollectionViewDelegate {
+    /// Called when the user sets a wallpaper active from the Library tab.
+    var onActivate: ((URL) -> Void)?
+
+    private(set) var activeURL: URL?
+    private let tabView = NSTabView()
+    private let pane = ActiveWallpaperPane()
 
     private let collection = NSCollectionView()
     private let emptyLabel = NSTextField(labelWithString: "Click “Add…” to import videos or GIFs.")
-    private let applyButton = NSButton(title: "Set as Wallpaper", target: nil, action: nil)
-    private let stillButton = NSButton(title: "Choose Lock Screen Still…", target: nil, action: nil)
+    private let activateButton = NSButton(title: "Set as Active Wallpaper", target: nil, action: nil)
     private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
     private let addButton = NSButton(title: "Add…", target: nil, action: nil)
-    private let nowLabel = NSTextField(labelWithString: "")
 
     private var urls: [URL] { Library.shared.urls }
 
     init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 560),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 840, height: 620),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "AniWallpaper Library"
+        w.title = "AniWallpaper"
         w.isReleasedWhenClosed = false
-        w.minSize = NSSize(width: 560, height: 360)
+        w.minSize = NSSize(width: 600, height: 420)
         w.center()
         super.init(window: w)
         build(in: w)
@@ -85,11 +90,36 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func setNowPlaying(_ name: String?) {
-        nowLabel.stringValue = name.map { "Now playing: \($0)" } ?? ""
+    /// Called by the app whenever the active wallpaper changes (including at launch).
+    func setActive(_ url: URL?) {
+        activeURL = url
+        pane.setActive(url)
+        reload()
     }
 
     private func build(in w: NSWindow) {
+        let libraryTab = NSTabViewItem(identifier: "library")
+        libraryTab.label = "Library"
+        libraryTab.view = buildLibraryView()
+        let activeTab = NSTabViewItem(identifier: "active")
+        activeTab.label = "Active Wallpaper"
+        activeTab.view = pane
+        tabView.addTabViewItem(libraryTab)
+        tabView.addTabViewItem(activeTab)
+        tabView.translatesAutoresizingMaskIntoConstraints = false
+        let c = w.contentView!
+        c.addSubview(tabView)
+        NSLayoutConstraint.activate([
+            tabView.topAnchor.constraint(equalTo: c.topAnchor, constant: 8),
+            tabView.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 8),
+            tabView.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -8),
+            tabView.bottomAnchor.constraint(equalTo: c.bottomAnchor, constant: -8),
+        ])
+    }
+
+    private func buildLibraryView() -> NSView {
+        let root = NSView()
+
         let layout = NSCollectionViewFlowLayout()
         layout.itemSize = NSSize(width: 210, height: 170)
         layout.minimumInteritemSpacing = 12
@@ -113,16 +143,13 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
         scroll.drawsBackground = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
-        for (b, a) in [(addButton, #selector(addTapped)), (applyButton, #selector(applyTapped)),
-                       (stillButton, #selector(stillTapped)), (removeButton, #selector(removeTapped))] {
+        for (b, a) in [(addButton, #selector(addTapped)), (activateButton, #selector(activateTapped)),
+                       (removeButton, #selector(removeTapped))] {
             b.target = self; b.action = a; b.bezelStyle = .rounded
         }
-        nowLabel.textColor = .secondaryLabelColor
-        nowLabel.lineBreakMode = .byTruncatingMiddle
-        nowLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let bar = NSStackView(views: [addButton, removeButton, nowLabel, spacer, stillButton, applyButton])
+        let bar = NSStackView(views: [addButton, removeButton, spacer, activateButton])
         bar.orientation = .horizontal
         bar.spacing = 10
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -130,21 +157,21 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
         emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let content = w.contentView!
-        content.addSubview(scroll)
-        content.addSubview(bar)
-        content.addSubview(emptyLabel)
+        root.addSubview(scroll)
+        root.addSubview(bar)
+        root.addSubview(emptyLabel)
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: content.topAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: root.topAnchor),
+            scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bar.topAnchor, constant: -10),
-            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16),
-            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
-            bar.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
-            emptyLabel.centerXAnchor.constraint(equalTo: content.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            bar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            bar.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            bar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
+            emptyLabel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: root.centerYAnchor),
         ])
+        return root
     }
 
     private func reload() {
@@ -159,10 +186,11 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
     }
 
     private func updateButtons() {
-        let has = selectedURL != nil
-        applyButton.isEnabled = has
-        stillButton.isEnabled = has
-        removeButton.isEnabled = has
+        let sel = selectedURL
+        let isActive = sel != nil && sel == activeURL
+        activateButton.isEnabled = sel != nil && !isActive
+        removeButton.isEnabled = sel != nil && !isActive
+        removeButton.toolTip = isActive ? "The active wallpaper can’t be removed. Set another one active first." : nil
     }
 
     // MARK: Actions
@@ -176,13 +204,19 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
         Library.shared.add(panel.urls)
     }
 
-    @objc private func applyTapped() { if let u = selectedURL { onApply?(u) } }
-    @objc private func stillTapped() { if let u = selectedURL { onPickStill?(u) } }
-    @objc private func removeTapped() { if let u = selectedURL { Library.shared.remove(u) } }
+    @objc private func activateTapped() {
+        if let u = selectedURL, u != activeURL { onActivate?(u) }
+    }
+
+    @objc private func removeTapped() {
+        guard let u = selectedURL, u != activeURL else { return }   // never remove the active wallpaper
+        Library.shared.remove(u)
+    }
 
     @objc private func doubleClicked(_ g: NSClickGestureRecognizer) {
         guard let ip = collection.indexPathForItem(at: g.location(in: collection)), urls.indices.contains(ip.item) else { return }
-        onApply?(urls[ip.item])
+        let u = urls[ip.item]
+        if u != activeURL { onActivate?(u) }
     }
 
     // MARK: Data source / delegate
@@ -191,7 +225,8 @@ final class LibraryWindowController: NSWindowController, NSCollectionViewDataSou
 
     func collectionView(_ cv: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
         let item = cv.makeItem(withIdentifier: WallpaperCell.id, for: indexPath) as! WallpaperCell
-        item.configure(url: urls[indexPath.item])
+        let u = urls[indexPath.item]
+        item.configure(url: u, isActive: u == activeURL)
         return item
     }
 

@@ -1,7 +1,6 @@
 import AppKit
 
-/// Lets the user scrub through a video and set one frame as the system wallpaper
-/// (which macOS also uses for the lock screen).
+/// Separate window for choosing which frame of the active video is used as the lock screen still.
 final class StillPickerWindowController: NSWindowController {
     private let url: URL
     private var duration: Double = 0
@@ -9,24 +8,28 @@ final class StillPickerWindowController: NSWindowController {
     private let slider = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
     private let timeLabel = NSTextField(labelWithString: "0:00.0")
     private let setButton = NSButton(title: "Set as Lock Screen Still", target: nil, action: nil)
+    private let resetButton = NSButton(title: "Reset to Default Still", target: nil, action: nil)
+    private let doneButton = NSButton(title: "Done", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "")
     private var previewTask: Task<Void, Never>?
 
     init(url: URL) {
         self.url = url
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 520),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
                          styleMask: [.titled, .closable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "Lock Screen Still — \(url.lastPathComponent)"
+        w.title = "Select Lock Screen Still: \(url.lastPathComponent)"
         w.isReleasedWhenClosed = false
-        w.minSize = NSSize(width: 480, height: 360)
+        w.minSize = NSSize(width: 560, height: 380)
         w.center()
         super.init(window: w)
         build(in: w)
+        refreshStatus()
         Task { @MainActor in
             duration = await FrameGrabber.duration(of: url)
             slider.maxValue = max(duration, 0.001)
             slider.isEnabled = duration > 0
+            slider.doubleValue = min(Settings.stillTime ?? 0, duration)
             refreshPreview()
         }
     }
@@ -50,16 +53,17 @@ final class StillPickerWindowController: NSWindowController {
         sliderRow.spacing = 10
         sliderRow.translatesAutoresizingMaskIntoConstraints = false
 
-        setButton.target = self
-        setButton.action = #selector(setTapped)
-        setButton.bezelStyle = .rounded
-        setButton.keyEquivalent = "\r"
+        setButton.target = self; setButton.action = #selector(setTapped)
+        resetButton.target = self; resetButton.action = #selector(resetTapped)
+        doneButton.target = self; doneButton.action = #selector(doneTapped)
+        for b in [setButton, resetButton, doneButton] { b.bezelStyle = .rounded }
+        doneButton.keyEquivalent = "\r"
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let bottom = NSStackView(views: [status, spacer, setButton])
+        let bottom = NSStackView(views: [status, spacer, resetButton, setButton, doneButton])
         bottom.spacing = 10
         bottom.translatesAutoresizingMaskIntoConstraints = false
 
@@ -79,11 +83,23 @@ final class StillPickerWindowController: NSWindowController {
         ])
     }
 
+    private static func format(_ t: Double) -> String {
+        String(format: "%d:%04.1f", Int(t) / 60, t.truncatingRemainder(dividingBy: 60))
+    }
+
+    private func refreshStatus() {
+        if let t = Settings.stillTime {
+            status.stringValue = "Lock screen still: frame at \(Self.format(t))"
+        } else {
+            status.stringValue = "Lock screen still: first frame (default)"
+        }
+    }
+
     @objc private func sliderMoved() { refreshPreview() }
 
     private func refreshPreview() {
         let t = slider.doubleValue
-        timeLabel.stringValue = String(format: "%d:%04.1f", Int(t) / 60, t.truncatingRemainder(dividingBy: 60))
+        timeLabel.stringValue = Self.format(t)
         previewTask?.cancel()
         previewTask = Task { @MainActor in
             guard let cg = await FrameGrabber.frame(of: url, at: t, maxWidth: 1280), !Task.isCancelled else { return }
@@ -91,41 +107,28 @@ final class StillPickerWindowController: NSWindowController {
         }
     }
 
-    @objc private func setTapped() {
-        setButton.isEnabled = false
-        status.stringValue = "Rendering full-resolution frame…"
-        let t = slider.doubleValue
+    @objc private func setTapped() { apply(at: slider.doubleValue, isDefault: false) }
+
+    @objc private func resetTapped() {
+        slider.doubleValue = 0
+        refreshPreview()
+        apply(at: 0, isDefault: true)
+    }
+
+    @objc private func doneTapped() { window?.close() }
+
+    private func apply(at t: Double, isDefault: Bool) {
+        [setButton, resetButton].forEach { $0.isEnabled = false }
+        status.stringValue = "Applying…"
         Task { @MainActor in
-            defer { setButton.isEnabled = true }
-            guard let cg = await FrameGrabber.frame(of: url, at: t, maxWidth: nil) else {
-                status.stringValue = "Couldn’t read that frame."
-                return
-            }
+            defer { [setButton, resetButton].forEach { $0.isEnabled = true } }
             do {
-                try Self.applyAsSystemWallpaper(cg, name: url.deletingPathExtension().lastPathComponent)
-                status.stringValue = "Done. Lock your Mac (⌃⌘Q) to see it."
+                try await LockScreenStill.apply(url: url, at: t)
+                Settings.stillTime = isDefault ? nil : t
+                refreshStatus()
             } catch {
                 status.stringValue = "Failed: \(error.localizedDescription)"
             }
-        }
-    }
-
-    static func applyAsSystemWallpaper(_ image: CGImage, name: String) throws {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("AniWallpaper/Stills", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Unique filename each time so macOS doesn't serve a cached copy of the old image.
-        let file = dir.appendingPathComponent("\(name)-\(Int(Date().timeIntervalSince1970)).png")
-        guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        try png.write(to: file)
-        let options: [NSWorkspace.DesktopImageOptionKey: Any] = [
-            .imageScaling: NSImageScaling.scaleProportionallyUpOrDown.rawValue,
-            .allowClipping: true,
-        ]
-        for screen in NSScreen.screens {
-            try NSWorkspace.shared.setDesktopImageURL(file, for: screen, options: options)
         }
     }
 }
